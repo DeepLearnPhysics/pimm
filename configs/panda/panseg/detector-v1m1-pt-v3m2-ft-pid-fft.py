@@ -1,9 +1,8 @@
 _base_ = ["../../_base_/default_runtime.py"]
 
 # misc custom setting
-num_gpus = 4
-batch_size = (12 * num_gpus)  # bs: total bs in all gpus
-num_worker = (6 * num_gpus)
+batch_size = 48  # bs: total bs in all gpus
+num_worker = 24
 val_batch_size = 1
 mix_prob = 0.0
 clip_grad = 1.0
@@ -15,13 +14,9 @@ seed = 0
 evaluate = True
 find_unused_parameters = False
 
-num_events_train = 1_000_000
-num_events_test = 1000
-
 # Weights & Biases specific settings
 use_wandb = True  # Enable Weights & Biases logging
 wandb_project = "PanSeg-PID-Sonata-PILArNet-M"  # Change to your desired project name
-wandb_run_name = f"sonata-pilarnet-panseg-pid-ft-v1-4GPU-{num_events_train}ev-256patch-fft-learned-STUFF_HEAD-20e"  # Descriptive name for this run
 
 # scheduler settings
 epoch = 20
@@ -99,11 +94,8 @@ model = dict(
             loss_weight_focal=2.0,
             loss_weight_dice=5.0,
             cls_weight_matched=2.0,
-            cls_weight_noobj=0.5,  # start; internal warmup to 2.0
-            noobj_warmup_start=0.5,
-            noobj_warmup_end=0.5,
+            cls_weight_noobj=0.5,
             momentum_loss_weight=1.0,
-            noobj_warmup_steps=epoch * (num_events_train // batch_size),
             focal_alpha=0.25,
             focal_gamma=2.0,
             aux_loss_weight=1.0,
@@ -203,7 +195,7 @@ data = dict(
         test_mode=False,
         energy_threshold=0.13,
         min_points=1024,
-        max_len=num_events_train,
+        max_len=1_000_000,  # override via --options data.train.max_len=X
         remove_low_energy_scatters=False,
     ),
     val=dict(
@@ -215,7 +207,7 @@ data = dict(
         test_mode=False,
         energy_threshold=0.13,
         min_points=1024,
-        max_len=num_events_test,
+        max_len=1000,
         remove_low_energy_scatters=False,
     ),
 )
@@ -223,6 +215,12 @@ data = dict(
 
 # hook
 hooks = [
+    # auto-generate wandb run name from config values
+    dict(
+        type="WandbNamer",
+        keys=("model.type", "data.train.max_len", "amp_dtype", "seed"),
+        extra="fft",
+    ),
     dict(
         type="CheckpointLoader",
         keywords="module.student.backbone",

@@ -17,6 +17,12 @@ class HookBase:
 
     trainer = None  # A weak reference to the trainer object.
 
+    def modify_config(self, cfg):
+        """Called after hooks are registered but before writer is built.
+        Hooks can modify the config here (e.g., wandb_run_name).
+        """
+        pass
+
     def before_train(self):
         pass
 

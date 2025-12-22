@@ -12,12 +12,9 @@ matmul_precision = "high"
 seed = 0
 evaluate = True
 
-num_events_train = 1_000_000
-num_events_test = 1000
 # Weights & Biases specific settings
 use_wandb = True  # Enable Weights & Biases logging
 wandb_project = "PartSeg-Sonata-PILArNet-M"  # Change to your desired project name
-wandb_run_name = f"sonata-pilarnet-semseg-ft-v1-4GPU-{num_events_train}ev-256patch-fft"  # Descriptive name for this run
 
 
 class_freqs = [1926651899, 2038240940, 34083197, 92015482, 1145363125]
@@ -67,20 +64,6 @@ model = dict(
     ],
     freeze_backbone=False,
 )
-
-# # scheduler settings
-# epoch = 20
-# eval_epoch = 20
-# optimizer = dict(type="AdamW", lr=0.0015, weight_decay=0.01)
-# scheduler = dict(
-#     type="OneCycleLR",
-#     max_lr=[0.0015, 0.00015],
-#     pct_start=0.05,
-#     anneal_strategy="cos",
-#     div_factor=10.0,
-#     final_div_factor=1000.0,
-# )
-# param_dicts = [dict(keyword="block", lr=0.00015)]
 
 # scheduler settings
 epoch = 20
@@ -182,7 +165,7 @@ data = dict(
         test_mode=False,
         energy_threshold=0.13,
         min_points=1024,
-        max_len=num_events_train,
+        max_len=1_000_000,  # override via --options data.train.max_len=X
         remove_low_energy_scatters=False,
     ),
     val=dict(
@@ -194,7 +177,7 @@ data = dict(
         test_mode=False,
         energy_threshold=0.13,
         min_points=1024,
-        max_len=num_events_test,
+        max_len=1000,
         remove_low_energy_scatters=False,
     ),
 )
@@ -202,6 +185,12 @@ data = dict(
 
 # hook
 hooks = [
+    # auto-generate wandb run name from config values
+    dict(
+        type="WandbNamer",
+        keys=("model.type", "data.train.max_len", "amp_dtype", "seed"),
+        extra="fft"
+    ),
     dict(
         type="CheckpointLoader",
         keywords="module.student.backbone",

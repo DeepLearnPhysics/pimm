@@ -823,9 +823,12 @@ class PretrainEvaluator(HookBase):
                     )
 
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        if "current_metric_value" not in self.trainer.comm_info.keys():
+            self.trainer.comm_info["current_metric_name"] = "mF1"
+        self.trainer.comm_info["current_metric_value"] = m_f1
         self.trainer.comm_info[f"{_prefix}_current_metric_value"] = m_f1
-        self.trainer.comm_info[f"{_prefix}_current_metric_name"] = "mF1"
         self.trainer.model.train()
+
 @HOOKS.register_module()
 class EnergyClassifierEvaluator(HookBase):
     def __init__(
@@ -1149,6 +1152,7 @@ class InstanceSegmentationEvaluator(HookBase):
 
             pred_masks_list = output_dict.get("pred_masks")
             pred_logits_list = output_dict.get("pred_logits")
+            pred_momentum_list = output_dict.get("pred_momentum")
             if not pred_masks_list or pred_logits_list is None:
                 self.trainer.logger.warning(
                     "InstanceSegmentationEvaluator: missing predictions"
@@ -1171,6 +1175,7 @@ class InstanceSegmentationEvaluator(HookBase):
                 "pred_logits": pred_logits_list,
                 "stuff_probs": stuff_probs,
                 "point_counts": point_counts,
+                "pred_momentum": pred_momentum_list,
             }
             
             results = model.postprocess(
@@ -1184,8 +1189,8 @@ class InstanceSegmentationEvaluator(HookBase):
             
             # Use instance_momentum from postprocess results if available
             pred_instance_momentum = None
-            if "instance_momentum" in results:
-                pred_instance_momentum = results["instance_momentum"].cpu()
+            if "pred_momentum" in results:
+                pred_instance_momentum = results["pred_momentum"].cpu()
 
             gt_inst = gt_instance.squeeze(-1).cpu().numpy().astype(np.int64)
             gt_pid = gt_segment.squeeze(-1).cpu().numpy().astype(np.int64)

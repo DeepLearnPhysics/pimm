@@ -106,6 +106,7 @@ def postprocess_panoptic(
     num_points: int,
     stuff_probs: Optional[torch.Tensor] = None,
     pred_momentum: Optional[torch.Tensor] = None,
+    pred_iou: Optional[torch.Tensor] = None,
     stuff_classes: Optional[Set[int]] = None,
     stuff_threshold: float = 0.5,
     mask_threshold: float = 0.5,
@@ -182,12 +183,21 @@ def postprocess_panoptic(
         sel_momentum = None
         if pred_momentum is not None:
             sel_momentum = pred_momentum[keep]
+        
+        sel_iou = None
+        if pred_iou is not None:
+            sel_iou = pred_iou[keep]
 
         # mask confidence: mean of sigmoid values within each mask
         mask_sums = (sel_sigmoid * sel_masks.float()).sum(dim=1)
         mask_counts = sel_masks.sum(dim=1).float().clamp(min=1)
         mask_confidences = mask_sums / mask_counts
-        combined_scores = mask_confidences * sel_scores
+        
+        # combine class score with mask confidence and predicted IoU (if available)
+        if sel_iou is not None:
+            combined_scores = mask_confidences * sel_scores * sel_iou
+        else:
+            combined_scores = mask_confidences * sel_scores
 
         # apply matrix NMS
         nms_scores, nms_labels, nms_masks, keep_inds = mask_matrix_nms(
@@ -277,6 +287,7 @@ def postprocess_panoptic(
         "confidences": pred_confidences,
         "query_labels": pred_query_labels,
         "instance_momentum": pred_instance_momentum,
+        "pred_iou": pred_iou,  # original per-query IoU predictions
     }
 
 
@@ -286,6 +297,7 @@ def postprocess_batch(
     pred_logits: List[torch.Tensor],
     stuff_probs: Optional[torch.Tensor] = None,
     pred_momentum: Optional[List[torch.Tensor]] = None,
+    pred_iou: Optional[List[torch.Tensor]] = None,
     point_counts: Optional[torch.Tensor] = None,
     stuff_classes: Optional[Set[int]] = None,
     **kwargs,
@@ -298,6 +310,7 @@ def postprocess_batch(
         pred_logits: list of (Q, C+1) class logits per batch
         stuff_probs: (N_total,) stuff probabilities (optional)
         pred_momentum: list of (Q,) or (Q, D) momentum predictions per batch (optional)
+        pred_iou: list of (Q,) predicted IoU scores per batch (optional)
         point_counts: (B,) number of points per batch element
         stuff_classes: set of stuff class indices
         **kwargs: additional arguments for postprocess_panoptic
@@ -308,6 +321,7 @@ def postprocess_batch(
             class_labels: (N_total,) class predictions
             confidences: (N_total,) confidence scores
             instance_momentum: (N_total, [D]) momentum predictions (optional)
+            pred_iou: list of (Q,) original IoU predictions per batch (optional)
     """
     batch_size = len(pred_masks)
 
@@ -316,6 +330,7 @@ def postprocess_batch(
     all_confidences = []
     all_query_labels = []
     all_instance_momentum = []
+    all_pred_iou = []
 
     if stuff_probs is not None and point_counts is not None:
         point_offsets = torch.cat([point_counts.new_zeros(1), point_counts.cumsum(dim=0)])
@@ -331,6 +346,10 @@ def postprocess_batch(
         pred_momentum_b = None
         if pred_momentum is not None:
             pred_momentum_b = pred_momentum[b]
+        
+        pred_iou_b = None
+        if pred_iou is not None:
+            pred_iou_b = pred_iou[b]
 
         stuff_probs_b = None
         if stuff_probs is not None and point_offsets is not None:
@@ -344,6 +363,7 @@ def postprocess_batch(
             num_points=num_points_b,
             stuff_probs=stuff_probs_b,
             pred_momentum=pred_momentum_b,
+            pred_iou=pred_iou_b,
             stuff_classes=stuff_classes,
             **kwargs,
         )
@@ -361,6 +381,8 @@ def postprocess_batch(
         all_query_labels.append(result["query_labels"])
         if result["instance_momentum"] is not None:
             all_instance_momentum.append(result["instance_momentum"])
+        if pred_iou_b is not None:
+            all_pred_iou.append(pred_iou_b)
 
     output = {
         "instance_labels": torch.cat(all_instance_labels, dim=0),
@@ -371,5 +393,9 @@ def postprocess_batch(
     
     if all_instance_momentum:
         output["instance_momentum"] = torch.cat(all_instance_momentum, dim=0)
+    
+    # keep pred_iou as list for loss computation
+    if all_pred_iou:
+        output["pred_iou"] = all_pred_iou
         
     return output

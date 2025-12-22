@@ -52,6 +52,10 @@ while getopts "p:d:c:n:w:g:m:r:a:" opt; do
   esac
 done
 
+# shift past processed options to get extra args (e.g., --options key=val)
+shift $((OPTIND-1))
+EXTRA_ARGS="$@"
+
 if [ "${NUM_GPU}" = 'None' ]
 then
   NUM_GPU=`$PYTHON -c 'import torch; print(torch.cuda.device_count())'`
@@ -119,7 +123,7 @@ fi
 
 if [ "${WEIGHT}" = "None" ]
 then
-    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE $COMMON_ARGS
+    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE $COMMON_ARGS $EXTRA_ARGS
 else
-    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE $COMMON_ARGS resume="$RESUME" weight="$WEIGHT"
+    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE $COMMON_ARGS resume="$RESUME" weight="$WEIGHT" $EXTRA_ARGS
 fi

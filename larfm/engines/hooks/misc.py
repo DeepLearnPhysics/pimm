@@ -33,6 +33,89 @@ from .builder import HOOKS
 
 
 @HOOKS.register_module()
+class WandbNamer(HookBase):
+    """
+    Auto-generate wandb_run_name from config values.
+    
+    Simple hook that joins specified config values with a separator to create
+    a descriptive wandb run name. No lambdas or templates - just a list of keys.
+    
+    Args:
+        keys: Tuple of config keys to include in name.
+              Supports nested keys: "data.train.max_len" or "model.type"
+        sep: Join character (default: "-")
+        format_numbers: Format large numbers with suffixes (1000000 -> 1M)
+        extra: Extra strings to append (str or tuple of strings), e.g. "fft", "scratch"
+    
+    Example:
+        dict(type="WandbNamer", keys=("model.type", "data.train.max_len", "seed"), extra="fft")
+        # generates: "Sonata-v1m1-1M-0-fft"
+    
+    CLI override:
+        --options wandb_run_name=my-custom-name  # overrides auto-generated name
+    """
+    
+    def __init__(self, keys=(), sep="-", format_numbers=True, extra=None):
+        self.keys = keys
+        self.sep = sep
+        self.format_numbers = format_numbers
+        # normalize extra to tuple
+        if extra is None:
+            self.extra = ()
+        elif isinstance(extra, str):
+            self.extra = (extra,)
+        else:
+            self.extra = tuple(extra)
+    
+    def _get_nested(self, cfg, key_path):
+        """Get nested config value: 'data.train.max_len' -> cfg.data['train']['max_len']"""
+        parts = key_path.split('.')
+        val = cfg
+        for part in parts:
+            if hasattr(val, part):
+                val = getattr(val, part)
+            elif isinstance(val, dict) and part in val:
+                val = val[part]
+            else:
+                return None
+        return val
+    
+    def _format_value(self, val):
+        """Format a value for the run name."""
+        if self.format_numbers and isinstance(val, (int, float)):
+            return self._format_number(val)
+        return str(val)
+    
+    def _format_number(self, n):
+        """Format large numbers with suffixes (K, M, B)."""
+        n_val = float(n)
+        if abs(n_val) >= 1_000_000_000:
+            return f"{n_val / 1_000_000_000:.1f}B".rstrip('0').rstrip('.')
+        elif abs(n_val) >= 1_000_000:
+            return f"{n_val / 1_000_000:.1f}M".rstrip('0').rstrip('.')
+        elif abs(n_val) >= 1_000:
+            return f"{n_val / 1_000:.1f}K".rstrip('0').rstrip('.')
+        return str(int(n_val) if n_val == int(n_val) else n_val)
+    
+    def modify_config(self, cfg):
+        """Build wandb_run_name from specified keys."""
+        # skip if wandb_run_name already set via CLI
+        if 'wandb_run_name' in getattr(cfg, '_cli_options', set()):
+            return
+        
+        parts = []
+        for key in self.keys:
+            val = self._get_nested(cfg, key)
+            if val is not None:
+                parts.append(self._format_value(val))
+        
+        # append extra strings
+        parts.extend(self.extra)
+        
+        if parts:
+            cfg.wandb_run_name = self.sep.join(parts)
+
+@HOOKS.register_module()
 class IterationTimer(HookBase):
     def __init__(self, warmup_iter=1):
         self._warmup_iter = warmup_iter
@@ -104,13 +187,28 @@ class InformationWriter(HookBase):
             model_output_dict = self.trainer.comm_info["model_output_dict"]
             # exclude large tensor outputs and keep only scalar-like entries
             large_tensor_keys = {'seg_logits', 'sem_logits', 'instance_embedding', 'vertex_embedding', 'sigma', 'point', 'pred_logits', 'pred_masks'}
+            
+            # if total_loss exists (synced loss), use it as 'loss' and skip original 'loss'
+            has_total_loss = 'total_loss' in model_output_dict
+            
             self.model_output_keys = [
                 k
                 for k in model_output_dict.keys()
-                if (k not in large_tensor_keys and k != 'teacher_logits' and "match_" not in k)
+                if (k not in large_tensor_keys and k != 'teacher_logits' and "match_" not in k
+                    and not (has_total_loss and k == 'loss')  # skip 'loss' if total_loss exists
+                    and k != 'total_loss')  # we'll handle total_loss separately
             ]
+            
+            # add 'loss' key if total_loss exists (to log total_loss as 'loss')
+            if has_total_loss:
+                self.model_output_keys.append('loss')
+            
             for key in self.model_output_keys:
-                val = model_output_dict[key]
+                # use total_loss value when logging 'loss'
+                if key == 'loss' and has_total_loss:
+                    val = model_output_dict['total_loss']
+                else:
+                    val = model_output_dict[key]
                 # support torch.Tensor, Python numbers; skip others gracefully
                 try:
                     if hasattr(val, "item") and callable(getattr(val, "item", None)):
@@ -221,10 +319,19 @@ class SelectiveMetricsLogger(HookBase):
         mod_dict = self.trainer.comm_info.get("model_output_dict", None)
         if mod_dict is None:
             return
+        
+        # if total_loss exists (synced loss), use it when logging 'loss'
+        has_total_loss = 'total_loss' in mod_dict
+        
         # select and log metrics every_n_steps
         if self.every_n_steps <= 0 or (self._step % self.every_n_steps) == 0:
             keys_to_pop = []
             for k, v in list(mod_dict.items()):
+                # skip total_loss and original loss if total_loss exists
+                if k == 'total_loss':
+                    continue
+                if k == 'loss' and has_total_loss:
+                    v = mod_dict['total_loss']  # use synced value
                 if not self._want_key(k):
                     continue
                 val = self._to_float(v)
@@ -513,33 +620,45 @@ class RuntimeProfiler(HookBase):
         if self.memory:
             torch.cuda.memory._record_memory_history()
 
-        for i, input_dict in enumerate(self.trainer.train_loader):
-            if i == self.warm_up + 1:
-                break
-            for key in input_dict.keys():
-                if isinstance(input_dict[key], torch.Tensor):
-                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=False,
-            ) as prof:
+
+        logdir = self.trainer.cfg.save_path + "/logdir/"
+        if not os.path.exists(logdir):
+            os.makedirs(logdir)
+
+        # schedule needs: wait + warmup + active steps (times repeat)
+        # loop runs warm_up + 1 iterations, so we match the schedule accordingly
+        num_steps = self.warm_up + 1
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                logdir, use_gzip=True
+            ),
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=max(1, num_steps - 1), repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            for i, input_dict in enumerate(self.trainer.train_loader):
+                if i == num_steps:
+                    break
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
                 if self.forward:
-                    with record_function("model_forward"):
-                        output_dict = self.trainer.model(input_dict)
+                    # with record_function("model_forward"):
+                    output_dict = self.trainer.model(input_dict)
                 else:
                     output_dict = self.trainer.model(input_dict)
 
                 loss = output_dict["loss"]
 
                 if self.backward:
-                    with record_function("model_backward"):
-                        loss.backward()
-            self.trainer.logger.info(f"Profile: [{i + 1}/{self.warm_up + 1}]")
+                    # with record_function("model_backward"):
+                    loss.backward()
+                prof.step()
+                
+                self.trainer.logger.info(f"Profile: [{i + 1}/{num_steps}]")
 
-        if not os.path.exists(self.trainer.cfg.save_path):
-            os.makedirs(self.trainer.cfg.save_path)
         if self.forward or self.backward:
             self.trainer.logger.info(
                 "Profile: \n"
@@ -549,9 +668,9 @@ class RuntimeProfiler(HookBase):
                     )
                 )
             )
-            prof.export_chrome_trace(
-                os.path.join(self.trainer.cfg.save_path, "trace.json")
-            )
+            # prof.export_chrome_trace(
+            #     os.path.join(self.trainer.cfg.save_path, "trace.json")
+            # )
 
         if self.memory:
             torch.cuda.memory._dump_snapshot(
@@ -895,7 +1014,6 @@ class DtypeOverrider(HookBase):
     
     def before_train(self):
         """Apply dtype overriding before training starts."""
-        self.trainer.logger.info(f"Overriding dtype to {self.dtype} for layers matching: {self.patterns}")
         self._override_layers(self.trainer.model)
         
         if self.verbose:
@@ -1246,7 +1364,8 @@ class PrototypeUsageLogger(HookBase):
             # Log to tensorboard/wandb if available
             if hasattr(self.trainer, 'writer') and self.trainer.writer is not None:
                 import wandb
-                global_step = wandb.run.step
+                # use wandb step if available, fallback to trainer iter
+                global_step = wandb.run.step if wandb.run else self.trainer.comm_info.get("iter", 0)
                 
                 # Log metrics
                 for stat_name, stat_value in stats.items():
@@ -1267,28 +1386,38 @@ class PrototypeUsageLogger(HookBase):
         return hook_fn
 
     def _get_stats(self, output):
-        """Calculate statistics from output."""
+        """Calculate statistics from output with proper distributed synchronization."""
+        import torch.distributed as dist
+        from larfm.utils.comm import get_world_size
+        
         with torch.no_grad():
             # Get assignments by taking argmax of logits
             assignments = output.argmax(dim=-1)  # (tokens,)
             
-            # Count unique prototypes used
-            unique_prototypes = torch.unique(assignments)
-            used_count = unique_prototypes.numel()
-            
             # Total number of prototypes
             total_prototypes = output.shape[-1]
             
-            # Calculate usage metrics
+            # Count tokens per prototype locally
+            local_counts = torch.bincount(assignments, minlength=total_prototypes).float()
+            
+            # Synchronize counts across all GPUs
+            if get_world_size() > 1:
+                dist.all_reduce(local_counts, op=dist.ReduceOp.SUM)
+            
+            global_counts = local_counts
+            total_tokens = global_counts.sum().item()
+            
+            # Calculate global usage metrics
+            used_mask = global_counts > 0
+            used_count = used_mask.sum().item()
             unused_count = total_prototypes - used_count
             unused_percent = (unused_count / total_prototypes) * 100
             
-            # Calculate tokens per prototype (average)
-            tokens_per_prototype = assignments.numel() / used_count if used_count > 0 else 0
+            # Calculate tokens per prototype (global average)
+            tokens_per_prototype = total_tokens / used_count if used_count > 0 else 0
             
-            # Calculate entropy of assignment distribution
-            counts = torch.bincount(assignments, minlength=total_prototypes)
-            probs = counts.float() / counts.sum()
+            # Calculate entropy of assignment distribution (global)
+            probs = global_counts / total_tokens if total_tokens > 0 else global_counts
             entropy = -torch.sum(probs * torch.log(probs + 1e-10))
             
             # Create stats dictionary
@@ -1412,16 +1541,44 @@ class FeatureStdMonitor(HookBase):
             else:
                 return
                 
-            # Calculate statistics
+            # Calculate statistics with proper distributed synchronization
             with torch.no_grad():
-                # Global std across all dimensions
-                global_std = torch.std(features).item()
+                import torch.distributed as dist
+                from larfm.utils.comm import get_world_size
                 
-                # Batch-wise std (across channels/features for each point)
+                features_flat = features.float()
+                local_n = torch.tensor([features_flat.numel()], device=features.device, dtype=torch.float64)
+                local_sum = features_flat.sum().to(torch.float64)
+                local_sum_sq = (features_flat ** 2).sum().to(torch.float64)
+                
+                # Synchronize across GPUs for global std
+                if get_world_size() > 1:
+                    dist.all_reduce(local_n)
+                    dist.all_reduce(local_sum)
+                    dist.all_reduce(local_sum_sq)
+                
+                global_mean = local_sum / local_n
+                global_var = (local_sum_sq / local_n) - (global_mean ** 2)
+                global_std = torch.sqrt(global_var.clamp(min=0)).item()
+                
+                # Batch-wise std (local is fine for this metric)
                 batch_std = torch.std(features, dim=1).mean().item()
                 
-                # Channel-wise std (across batch/points for each channel)
-                channel_std = torch.std(features, dim=0)
+                # Channel-wise std with distributed sync
+                # Each GPU: compute local sum and sum_sq per channel
+                local_channel_n = torch.tensor([features.shape[0]], device=features.device, dtype=torch.float64)
+                local_channel_sum = features.sum(dim=0).to(torch.float64)  # (channels,)
+                local_channel_sum_sq = (features ** 2).sum(dim=0).to(torch.float64)
+                
+                if get_world_size() > 1:
+                    dist.all_reduce(local_channel_n)
+                    dist.all_reduce(local_channel_sum)
+                    dist.all_reduce(local_channel_sum_sq)
+                
+                channel_mean = local_channel_sum / local_channel_n
+                channel_var = (local_channel_sum_sq / local_channel_n) - (channel_mean ** 2)
+                channel_std = torch.sqrt(channel_var.clamp(min=0))
+                
                 channel_mean_std = channel_std.mean().item()
                 channel_min_std = channel_std.min().item()
                 channel_max_std = channel_std.max().item()
@@ -1437,8 +1594,8 @@ class FeatureStdMonitor(HookBase):
             # Log to tensorboard/wandb if available
             if hasattr(self.trainer, 'writer') and self.trainer.writer is not None:
                 import wandb
-                # use wandb step if available; avoid unused locals
-                global_step = wandb.run.step
+                # use wandb step if available, fallback to trainer iter
+                global_step = wandb.run.step if wandb.run else self.trainer.comm_info.get("iter", 0)
                 
                 # Log metrics
                 for stat_name, stat_value in stats.items():

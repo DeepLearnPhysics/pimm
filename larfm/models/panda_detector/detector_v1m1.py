@@ -77,6 +77,12 @@ class SelfAttentionLayer(nn.Module):
     def with_pos(self, qkv: torch.Tensor, q_pos: torch.Tensor) -> torch.Tensor:
         return qkv + q_pos if q_pos is not None else qkv
 
+    def k(self, t: torch.Tensor) -> torch.Tensor:
+        return F.linear(t, self.kv.weight[:self.channels, :], self.kv.bias[:self.channels])
+
+    def v(self, t: torch.Tensor) -> torch.Tensor:
+        return F.linear(t, self.kv.weight[self.channels:, :], self.kv.bias[self.channels:])
+
     def forward(
         self, qkv: torch.Tensor, q_pos: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
     ) -> torch.Tensor:
@@ -84,12 +90,14 @@ class SelfAttentionLayer(nn.Module):
         C = self.channels
 
         q = self.q(self.with_pos(qkv, q_pos))
-        kv = self.kv(qkv)
+        k = self.k(self.with_pos(qkv, q_pos))
+        v = self.v(qkv)
         
         if self.enable_flash and flash_attn is not None and q.is_cuda:
             feat = flash_attn.flash_attn_varlen_func(
                 q.to(torch.bfloat16).reshape(-1, H, C // H),
-                *kv.to(torch.bfloat16).reshape(-1, 2, H, C // H).permute(1, 0, 2, 3).unbind(dim=0),
+                k.to(torch.bfloat16).reshape(-1, H, C // H),
+                v.to(torch.bfloat16).reshape(-1, H, C // H),
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
@@ -101,7 +109,8 @@ class SelfAttentionLayer(nn.Module):
         else:
             q_dtype = q.dtype
             q = q.to(torch.bfloat16).reshape(-1, H, C // H)
-            k, v = kv.to(torch.bfloat16).reshape(-1, 2, H, C // H).permute(1, 0, 2, 3).unbind(dim=0)
+            k = k.to(torch.bfloat16).reshape(-1, H, C // H)
+            v = v.to(torch.bfloat16).reshape(-1, H, C // H)
             if self.upcast_attention:
                 q = q.float()
                 k = k.float()

@@ -44,6 +44,27 @@ class MomentumRegressor(nn.Module):
         )
         return backbone_features.squeeze(-1)
 
+
+class IoUPredictor(nn.Module):
+    """Predicts the IoU between predicted mask and GT mask for each query."""
+    
+    def __init__(self, hidden_channels):
+        super().__init__()
+        self.mlp = MLP(hidden_channels, hidden_channels, 1)
+    
+    def forward(self, q_features):
+        """
+        Predict IoU score for each query.
+        
+        Args:
+            q_features: (N_q, hidden_channels) query features
+            
+        Returns:
+            iou_pred: (N_q,) predicted IoU in [0, 1] (sigmoid applied)
+        """
+        logits = self.mlp(q_features).squeeze(-1)
+        return logits.sigmoid()
+
 class LayerScale(nn.Module):
     def __init__(
         self,
@@ -98,6 +119,12 @@ class SelfAttentionLayer(nn.Module):
     def with_pos(self, qkv: torch.Tensor, q_pos: torch.Tensor) -> torch.Tensor:
         return qkv + q_pos if q_pos is not None else qkv
 
+    def k(self, t: torch.Tensor) -> torch.Tensor:
+        return F.linear(t, self.kv.weight[:self.channels, :], self.kv.bias[:self.channels])
+
+    def v(self, t: torch.Tensor) -> torch.Tensor:
+        return F.linear(t, self.kv.weight[self.channels:, :], self.kv.bias[self.channels:])
+        
     def forward(
         self, qkv: torch.Tensor, q_pos: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
     ) -> torch.Tensor:
@@ -105,12 +132,14 @@ class SelfAttentionLayer(nn.Module):
         C = self.channels
 
         q = self.q(self.with_pos(qkv, q_pos))
-        kv = self.kv(qkv)
+        k = self.k(self.with_pos(qkv, q_pos))
+        v = self.v(qkv)
         
         if self.enable_flash and flash_attn is not None and q.is_cuda:
             feat = flash_attn.flash_attn_varlen_func(
                 q.to(torch.bfloat16).reshape(-1, H, C // H),
-                *kv.to(torch.bfloat16).reshape(-1, 2, H, C // H).permute(1, 0, 2, 3).unbind(dim=0),
+                k.to(torch.bfloat16).reshape(-1, H, C // H),
+                v.to(torch.bfloat16).reshape(-1, H, C // H),
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
@@ -122,7 +151,8 @@ class SelfAttentionLayer(nn.Module):
         else:
             q_dtype = q.dtype
             q = q.to(torch.bfloat16).reshape(-1, H, C // H)
-            k, v = kv.to(torch.bfloat16).reshape(-1, 2, H, C // H).permute(1, 0, 2, 3).unbind(dim=0)
+            k = k.to(torch.bfloat16).reshape(-1, H, C // H)
+            v = v.to(torch.bfloat16).reshape(-1, H, C // H)
             if self.upcast_attention:
                 q = q.float()
                 k = k.float()
@@ -615,6 +645,7 @@ class MaskQueryDecoder(nn.Module):
         stuff_classes=None,
         supervise_attn_mask=True,
         train_filter_use_gt: bool = False,
+        predict_iou: bool = False,
     ):
         super().__init__()
         self.full_in_channels = full_in_channels
@@ -695,6 +726,11 @@ class MaskQueryDecoder(nn.Module):
         # momentum regression head: mixture of class-experts
         # shared MLP backbone processes queries
         self.momentum_regressor = MomentumRegressor(hidden_channels, num_classes)
+        
+        # IoU prediction head: predicts mask quality (IoU with GT)
+        self.predict_iou = predict_iou
+        if self.predict_iou:
+            self.iou_pred = IoUPredictor(hidden_channels)
 
         # stuff head: point-wise binary classifier (stuff vs thing)
         if self.use_stuff_head:
@@ -912,11 +948,13 @@ class MaskQueryDecoder(nn.Module):
         """
         class_embed = self.cls_pred(q_features)
         momentum_pred = self.momentum_regressor(q_features, class_embed)
+        iou_pred = self.iou_pred(q_features) if self.predict_iou else None
 
         pred_masks = []
         pred_cls = []
         pred_logits = []
         pred_momentum = []
+        pred_iou = [] if self.predict_iou else None
 
         C = self.num_classes
 
@@ -945,6 +983,10 @@ class MaskQueryDecoder(nn.Module):
             pred_masks.append(mask_logits_b)
             pred_cls.append(cls_b)
             pred_momentum.append(momentum_b)
+            
+            if self.predict_iou:
+                iou_b = iou_pred[q_start:q_end][valid_b]
+                pred_iou.append(iou_b)
 
             if mask_logits_b.shape[0] > 0:
                 s = mask_logits_b.transpose(0, 1).unsqueeze(-1)
@@ -960,6 +1002,7 @@ class MaskQueryDecoder(nn.Module):
             "pred_masks": pred_masks,  # List[Tensor(Q_b, P_b)] for loss
             "pred_logits": pred_cls,  # List[Tensor(Q_b, C+1)] for classification loss
             "pred_momentum": pred_momentum,  # List[Tensor(Q_b,)]
+            "pred_iou": pred_iou,  # List[Tensor(Q_b,)] predicted IoU scores
             "seg_logits": pred_logits,  # Tensor(N, C) for per-point prediction
         }
 
@@ -1086,6 +1129,7 @@ class Detector(PointModel):
         supervise_attn_mask=True,
         train_filter_use_gt: bool = False,
         mlp_point_proj=False,
+        predict_iou=False,  # predict mask IoU and use in scoring (Mask Scoring R-CNN style)
         # postprocessing parameters
         stuff_threshold=0.5,
         mask_threshold=0.5,
@@ -1129,6 +1173,7 @@ class Detector(PointModel):
             supervise_attn_mask=supervise_attn_mask,
             train_filter_use_gt=train_filter_use_gt,
             mlp_point_proj=mlp_point_proj,
+            predict_iou=predict_iou,
         )
         
         # configure attention mask annealing
@@ -1205,6 +1250,9 @@ class Detector(PointModel):
                 loss = loss + stuff_loss
                 return_dict["stuff_loss"] = stuff_loss
             
+            # note: IoU loss is computed in the criteria, same as momentum loss
+            # pred_iou is included in outputs for the criteria to use
+            
             return_dict["loss"] = loss
         # eval
         elif "segment" in input_dict.keys():
@@ -1212,21 +1260,25 @@ class Detector(PointModel):
             return_dict.update(components)
             return_dict["loss"] = loss
             return_dict["seg_logits"] = point.pred_logits
-            # also return raw outputs for QueryInsSegEvaluator
+            # also return raw outputs for evaluator
             if hasattr(point, 'outputs') and point.outputs is not None:
                 return_dict["pred_logits"] = point.outputs.get("pred_logits")
                 return_dict["pred_momentum"] = point.outputs.get("pred_momentum")
                 return_dict["pred_masks"] = point.outputs.get("pred_masks")
+                return_dict["pred_iou"] = point.outputs.get("pred_iou")
+                return_dict["stuff_probs"] = point.outputs.get("stuff_probs")
         # test
         else:
             return_dict["seg_logits"] = point.pred_logits
-            # return raw outputs for QueryInsSegEvaluator
+            # return raw outputs for evaluator
             if hasattr(point, 'outputs') and point.outputs is not None:
                 return_dict["pred_logits"] = point.outputs.get("pred_logits")
                 return_dict["pred_momentum"] = point.outputs.get("pred_momentum")
                 return_dict["pred_masks"] = point.outputs.get("pred_masks")
+                return_dict["pred_iou"] = point.outputs.get("pred_iou")
+                return_dict["stuff_probs"] = point.outputs.get("stuff_probs")
 
-        # synchronize loss components across GPUs for consistent logging
+        # synchronize loss components
         if get_world_size() > 1:
             for key, value in return_dict.items():
                 # only sync scalar tensors (loss values), not predictions
@@ -1270,8 +1322,10 @@ class Detector(PointModel):
         return postprocess_batch(
             pred_masks=forward_output["pred_masks"],
             pred_logits=forward_output["pred_logits"],
-            stuff_probs=forward_output["stuff_probs"],
+            stuff_probs=forward_output.get("stuff_probs"),
             point_counts=forward_output["point_counts"],
+            pred_momentum=forward_output.get("pred_momentum"),
+            pred_iou=forward_output.get("pred_iou"),
             stuff_classes=self.decoder.stuff_classes,
             **cfg,
         )

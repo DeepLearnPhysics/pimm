@@ -48,6 +48,7 @@ class InstanceSegmentationLoss(nn.Module):
         noobj_warmup_end: float = None,
         noobj_warmup_steps: int = None,
         momentum_loss_weight: float = 0.0,
+        iou_loss_weight: float = 0.0,
     ):
         super().__init__()
         
@@ -68,6 +69,7 @@ class InstanceSegmentationLoss(nn.Module):
             focal_gamma=focal_gamma,
             truth_label=truth_label,
             momentum_loss_weight=momentum_loss_weight,
+            iou_loss_weight=iou_loss_weight,
         )
 
         # optional linear warmup schedule for no-object class weight
@@ -134,6 +136,8 @@ class InstanceSegmentationLoss(nn.Module):
                     components[f"aux_cls_noobj_L{layer_idx}"] = aux_comp["cls_noobj"]
                 if "momentum" in aux_comp:
                     components[f"aux_momentum_L{layer_idx}"] = aux_comp["momentum"]
+                if "iou" in aux_comp:
+                    components[f"aux_iou_L{layer_idx}"] = aux_comp["iou"]
 
             final_loss = final_loss + self.aux_loss_weight * aux_loss
 
@@ -158,6 +162,8 @@ class InstanceSegmentationLoss(nn.Module):
             - aux_dice_L{i}: per-auxiliary-layer dice loss (if aux_outputs present)
             - momentum: momentum regression loss (if pred_momentum and momentum available)
             - aux_momentum_L{i}: per-auxiliary-layer momentum loss (if aux_outputs present)
+            - iou: IoU prediction loss (if pred_iou available)
+            - aux_iou_L{i}: per-auxiliary-layer IoU loss (if aux_outputs present)
         """
         # if pred is Point object with outputs attr, extract it
         if hasattr(pred, 'outputs'):
@@ -181,6 +187,8 @@ class InstanceSegmentationLoss(nn.Module):
                     components[f"aux_cls_noobj_L{layer_idx}"] = aux_comp["cls_noobj"]
                 if "momentum" in aux_comp:
                     components[f"aux_momentum_L{layer_idx}"] = aux_comp["momentum"]
+                if "iou" in aux_comp:
+                    components[f"aux_iou_L{layer_idx}"] = aux_comp["iou"]
         
         return components
 
@@ -200,6 +208,7 @@ class SingleLayerInstanceLoss(nn.Module):
         focal_gamma: float = 2.0,
         truth_label: str = "segment",
         momentum_loss_weight: float = 0.0,
+        iou_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.ignore_index = ignore_index
@@ -210,6 +219,7 @@ class SingleLayerInstanceLoss(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.momentum_loss_weight = momentum_loss_weight
+        self.iou_loss_weight = iou_loss_weight
 
         # matcher used internally
         self.matcher = _HungarianMatcher(
@@ -462,6 +472,62 @@ class SingleLayerInstanceLoss(nn.Module):
         mom_gt_matched = mom_gt_per_inst[idx_gt.long()]
         return F.smooth_l1_loss(mom_pred_matched, mom_gt_matched, reduction="mean")
 
+    def _compute_iou_targets(
+        self,
+        pred_sel: torch.Tensor,
+        gt_sel: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute actual IoU between predicted masks and GT masks for matched pairs.
+        
+        Args:
+            pred_sel: (M, K) predicted mask logits for matched queries
+            gt_sel: (M, K) ground truth binary masks for matched instances
+            
+        Returns:
+            iou_targets: (M,) actual IoU values in [0, 1]
+        """
+        pred_binary = pred_sel.sigmoid() > 0.5
+        intersection = (pred_binary * gt_sel).sum(dim=1)
+        union = pred_binary.sum(dim=1) + gt_sel.sum(dim=1) - intersection
+        iou_targets = intersection / (union + 1e-6)
+        return iou_targets
+
+    def _compute_iou_loss(
+        self,
+        iou_pred_b: torch.Tensor,
+        pred_sel: torch.Tensor,
+        gt_sel: torch.Tensor,
+        idx_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute IoU prediction loss for matched pairs.
+        
+        Args:
+            iou_pred_b: (Q,) predicted IoU scores for all queries
+            pred_sel: (M, K) predicted mask logits for matched queries
+            gt_sel: (M, K) ground truth binary masks for matched instances
+            idx_q: (M,) indices of matched queries
+            
+        Returns:
+            iou_loss: scalar MSE loss between predicted and actual IoU
+        """
+        iou_pred_matched = iou_pred_b[idx_q.long()]
+        iou_targets = self._compute_iou_targets(pred_sel, gt_sel)
+        return F.mse_loss(iou_pred_matched, iou_targets, reduction="mean")
+
+    def _compute_iou_components(
+        self,
+        iou_pred_b: torch.Tensor,
+        pred_sel: torch.Tensor,
+        gt_sel: torch.Tensor,
+        idx_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """compute IoU regression loss components for logging"""
+        iou_pred_matched = iou_pred_b[idx_q.long()]
+        iou_targets = self._compute_iou_targets(pred_sel, gt_sel)
+        return F.mse_loss(iou_pred_matched, iou_targets, reduction="mean")
+
     def forward(
         self, pred: Dict[str, List[torch.Tensor]], input_dict: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
@@ -496,8 +562,10 @@ class SingleLayerInstanceLoss(nn.Module):
         total_loss_dice = pred_masks_list[0].new_tensor(0.0)
         total_loss_cls = pred_masks_list[0].new_tensor(0.0)
         total_loss_momentum = pred_masks_list[0].new_tensor(0.0)
+        total_loss_iou = pred_masks_list[0].new_tensor(0.0)
         num_batches_with_loss = 0
         num_batches_with_momentum = 0
+        num_batches_with_iou = 0
 
         # component tracking
         total_focal = pred_masks_list[0].new_tensor(0.0)
@@ -509,6 +577,8 @@ class SingleLayerInstanceLoss(nn.Module):
         count_ce_noobj = pred_masks_list[0].new_tensor(0.0)
         total_momentum_loss = pred_masks_list[0].new_tensor(0.0)
         count_momentum_batches = 0
+        total_iou_loss = pred_masks_list[0].new_tensor(0.0)
+        count_iou_batches = 0
         queries_total = pred_masks_list[0].new_tensor(0.0)
         gt_instances_total = pred_masks_list[0].new_tensor(0.0)
         class_totals = None
@@ -631,8 +701,26 @@ class SingleLayerInstanceLoss(nn.Module):
                 total_momentum_loss = total_momentum_loss + loss_momentum_comp
                 count_momentum_batches += 1
 
+            # IoU prediction loss (supervise predicted IoU with actual IoU)
+            if self.iou_loss_weight > 0 and "pred_iou" in pred:
+                iou_pred_b = pred["pred_iou"][b].to(pm_b.device)
+                loss_iou_b = self._compute_iou_loss(
+                    iou_pred_b, pred_sel, gt_sel, idx_q
+                )
+                total_loss_iou = total_loss_iou + loss_iou_b
+                num_batches_with_iou += 1
+
+                # track unweighted IoU component
+                loss_iou_comp = self._compute_iou_components(
+                    iou_pred_b, pred_sel, gt_sel, idx_q
+                )
+                total_iou_loss = total_iou_loss + loss_iou_comp
+                count_iou_batches += 1
+
         if num_batches_with_momentum > 0:
             total_loss_momentum = total_loss_momentum / num_batches_with_momentum
+        if num_batches_with_iou > 0:
+            total_loss_iou = total_loss_iou / num_batches_with_iou
 
         # average over batch
         denom = max(num_batches_with_loss, 1)
@@ -640,7 +728,12 @@ class SingleLayerInstanceLoss(nn.Module):
             total_loss_focal / denom
         ) + self.loss_weight_dice * (total_loss_dice / denom)
         loss_cls = total_loss_cls / denom
-        loss = loss_masks + loss_cls + self.momentum_loss_weight * total_loss_momentum
+        loss = (
+            loss_masks
+            + loss_cls
+            + self.momentum_loss_weight * total_loss_momentum
+            + self.iou_loss_weight * total_loss_iou
+        )
 
         # build components dict
         denom_pairs = max(int(total_pairs), 1)
@@ -657,6 +750,9 @@ class SingleLayerInstanceLoss(nn.Module):
             else total_focal.new_tensor(0.0),
             "momentum": (total_momentum_loss / count_momentum_batches)
             if count_momentum_batches > 0
+            else total_focal.new_tensor(0.0),
+            "iou": (total_iou_loss / count_iou_batches)
+            if count_iou_batches > 0
             else total_focal.new_tensor(0.0),
             "num_pairs": total_pairs,
             "queries_total": queries_total,

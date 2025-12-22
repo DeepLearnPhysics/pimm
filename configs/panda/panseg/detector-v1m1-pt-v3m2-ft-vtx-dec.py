@@ -1,9 +1,8 @@
 _base_ = ["../../_base_/default_runtime.py"]
 
 # misc custom setting
-num_gpus = 4
-batch_size = 12 * num_gpus  # bs: total bs in all gpus
-num_worker = 6 * num_gpus
+batch_size = 48  # bs: total bs in all gpus
+num_worker = 24
 val_batch_size = 1
 mix_prob = 0.0
 clip_grad = 1.0
@@ -15,13 +14,9 @@ seed = 0
 evaluate = True
 find_unused_parameters = False
 
-num_events_train = 1_000_000
-num_events_test = 1000
-
 # Weights & Biases specific settings
 use_wandb = True  # Enable Weights & Biases logging
 wandb_project = "InsSeg-VTX-Sonata-PILArNet-M"  # Change to your desired project name
-wandb_run_name = f"sonata-pilarnet-insseg-vtx-ft-v1-4GPU-{num_events_train}ev-256patch-lin-learned-STUFF_HEAD"  # Descriptive name for this run
 
 epoch = 20
 eval_epoch = 20
@@ -194,7 +189,7 @@ data = dict(
         test_mode=False,
         energy_threshold=0.13,
         min_points=1024,
-        max_len=num_events_train,
+        max_len=1_000_000,  # override via --options data.train.max_len=X
         remove_low_energy_scatters=False,
     ),
     val=dict(
@@ -206,7 +201,7 @@ data = dict(
         test_mode=False,
         energy_threshold=0.13,
         min_points=1024,
-        max_len=num_events_test,
+        max_len=1000,
         remove_low_energy_scatters=False,
     ),
 )
@@ -214,6 +209,12 @@ data = dict(
 
 # hook
 hooks = [
+    # auto-generate wandb run name from config values
+    dict(
+        type="WandbNamer",
+        keys=("model.type", "data.train.max_len", "amp_dtype", "seed"),
+        extra="dec",
+    ),
     dict(
         type="CheckpointLoader",
         keywords="module.student.backbone",

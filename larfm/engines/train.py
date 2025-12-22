@@ -142,8 +142,6 @@ class Trainer(TrainerBase):
         self.logger.info(f"Config:\n{cfg.pretty_text}")
         self.logger.info("=> Building model ...")
         self.model = self.build_model()
-        self.logger.info("=> Building writer ...")
-        self.writer = self.build_writer()
         self.logger.info("=> Building train dataset & dataloader ...")
         self.train_loader = self.build_train_loader()
         self.logger.info("=> Building val dataset & dataloader ...")
@@ -155,6 +153,11 @@ class Trainer(TrainerBase):
         self.scaler = self.build_scaler()
         self.logger.info("=> Building hooks ...")
         self.register_hooks(self.cfg.hooks)
+        self.logger.info("=> Running config modifiers ...")
+        for h in self.hooks:
+            h.modify_config(self.cfg)
+        self.logger.info("=> Building writer ...")
+        self.writer = self.build_writer()
         
 
     def train(self):
@@ -274,11 +277,11 @@ class Trainer(TrainerBase):
     def build_writer(self):
         if self.cfg.get('use_wandb', False):
             writer = WandbSummaryWriter(
-                project=self.cfg.get('wandb_project', 'pointcept'),
+                project=self.cfg.get('wandb_project', 'larfm'),
                 name=self.cfg.get('wandb_run_name', os.path.basename(self.cfg.save_path)),
                 config=self.cfg
             ) if comm.is_main_process() else None
-            self.logger.info(f"Weights & Biases writer initialized with project: {self.cfg.get('wandb_project', 'pointcept')}")
+            self.logger.info(f"Weights & Biases writer initialized with project: {self.cfg.get('wandb_project', 'larfm')}")
         else:
             writer = SummaryWriter(self.cfg.save_path) if comm.is_main_process() else None
             self.logger.info(f"Tensorboard writer logging dir: {self.cfg.save_path}")

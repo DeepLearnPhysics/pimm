@@ -1743,145 +1743,6 @@ class LocalCovarianceFeatures(object):
         data_dict["index_valid_keys"].append(self.out_keys[1])
         return data_dict
 
-# @TRANSFORMS.register_module()
-# class HierarchicalMaskGenerator(object):
-#     """
-#     Generate hierarchical masks for MAE-style pretraining.
-    
-#     Masks patches at a coarse grid level and prepares data for reconstruction.
-#     Points are grouped into patches at patch_size granularity, then a fraction
-#     are randomly masked. The visible points go to the encoder, while masked
-#     patch information is stored for the decoder to reconstruct.
-#     """
-    
-#     def __init__(
-#         self,
-#         patch_size: float = 0.016,
-#         mask_ratio: float = 0.6,
-#         points_per_patch: int = 128,
-#         min_points_per_patch: int = 4,
-#         view_keys: tuple = ("coord", "origin_coord", "energy"),
-#     ):
-#         """
-#         Args:
-#             patch_size: size of patches at the coarsest level (should match encoder output)
-#             mask_ratio: fraction of patches to mask
-#             points_per_patch: fixed K points to predict per patch
-#             min_points_per_patch: minimum points for a patch to be valid
-#             view_keys: keys to process for visible/masked split
-#         """
-#         self.patch_size = patch_size
-#         self.mask_ratio = mask_ratio
-#         self.points_per_patch = points_per_patch
-#         self.min_points_per_patch = min_points_per_patch
-#         self.view_keys = view_keys
-    
-#     def __call__(self, data_dict):
-#         coord = data_dict["coord"]
-#         n_points = coord.shape[0]
-        
-#         # compute patch assignments at coarse level
-#         coord_min = coord.min(axis=0)
-#         grid_coord = ((coord - coord_min) / self.patch_size).astype(np.int32)
-        
-#         # create unique patch ids using spatial hashing
-#         # pack (x, y, z) into a single int64
-#         patch_ids = (
-#             grid_coord[:, 0].astype(np.int64) * 1000000 +
-#             grid_coord[:, 1].astype(np.int64) * 1000 +
-#             grid_coord[:, 2].astype(np.int64)
-#         )
-        
-#         # get unique patches and their point assignments
-#         unique_patches, inverse_indices, patch_counts = np.unique(
-#             patch_ids, return_inverse=True, return_counts=True
-#         )
-#         n_patches = len(unique_patches)
-        
-#         # filter patches with too few points
-#         valid_patch_mask = patch_counts >= self.min_points_per_patch
-#         valid_patch_indices = np.where(valid_patch_mask)[0]
-#         n_valid_patches = len(valid_patch_indices)
-        
-#         if n_valid_patches < 2:
-#             # fallback: return original data if not enough patches
-#             data_dict["hmae_valid"] = False
-#             return data_dict
-        
-#         # randomly select patches to mask
-#         n_mask = max(1, int(n_valid_patches * self.mask_ratio))
-#         n_visible = n_valid_patches - n_mask
-        
-#         perm = np.random.permutation(n_valid_patches)
-#         masked_patch_local_idx = perm[:n_mask]
-#         visible_patch_local_idx = perm[n_mask:]
-        
-#         masked_patch_idx = valid_patch_indices[masked_patch_local_idx]
-#         visible_patch_idx = valid_patch_indices[visible_patch_local_idx]
-        
-#         # create point masks
-#         masked_patches_set = set(masked_patch_idx)
-#         visible_patches_set = set(visible_patch_idx)
-        
-#         point_in_masked = np.array([inverse_indices[i] in masked_patches_set for i in range(n_points)])
-#         point_in_visible = np.array([inverse_indices[i] in visible_patches_set for i in range(n_points)])
-        
-#         # extract visible points
-#         visible_mask = point_in_visible
-#         visible_data = {}
-#         for key in self.view_keys:
-#             if key in data_dict:
-#                 visible_data[key] = data_dict[key][visible_mask]
-        
-#         # compute masked patch centroids and extract target points
-#         masked_centroids = []
-#         masked_target_coords = []  # relative to centroid
-#         masked_target_energy = []
-#         masked_point_counts = []
-        
-#         # normalization factor: half patch size maps to [-1, 1]
-#         norm_factor = self.patch_size / 2.0
-        
-#         for patch_idx in masked_patch_idx:
-#             patch_mask = inverse_indices == patch_idx
-#             patch_coord = coord[patch_mask]
-            
-#             # compute centroid
-#             centroid = patch_coord.mean(axis=0)
-#             masked_centroids.append(centroid)
-            
-#             # store relative coordinates normalized to [-1, 1]
-#             rel_coord = (patch_coord - centroid) / norm_factor
-#             masked_target_coords.append(rel_coord)
-            
-#             # store energy if available
-#             if "energy" in data_dict:
-#                 patch_energy = data_dict["energy"][patch_mask]
-#                 masked_target_energy.append(patch_energy)
-            
-#             masked_point_counts.append(patch_coord.shape[0])
-        
-#         # pack results
-#         data_dict["hmae_valid"] = True
-        
-#         # visible points for encoder
-#         data_dict["visible_coord"] = visible_data.get("coord", np.array([]))
-#         data_dict["visible_origin_coord"] = visible_data.get("origin_coord", visible_data.get("coord", np.array([])))
-#         data_dict["visible_energy"] = visible_data.get("energy", np.zeros((visible_data["coord"].shape[0], 1)))
-        
-#         # masked patch info for decoder
-#         data_dict["masked_centroids"] = np.array(masked_centroids, dtype=np.float32)
-#         data_dict["masked_point_counts"] = np.array(masked_point_counts, dtype=np.int64)
-        
-#         # target points for reconstruction loss (packed format)
-#         data_dict["masked_target_coords"] = masked_target_coords  # list of arrays
-#         data_dict["masked_target_energy"] = masked_target_energy  # list of arrays
-        
-#         # also keep track of patch count
-#         data_dict["n_visible_patches"] = n_visible
-#         data_dict["n_masked_patches"] = n_mask
-        
-#         return data_dict
 
 @TRANSFORMS.register_module()
 class HierarchicalMaskGenerator(object):
@@ -1891,6 +1752,12 @@ class HierarchicalMaskGenerator(object):
     Points are grouped into patches at patch_size granularity, then a fraction
     are randomly masked. The visible points go to the encoder, while masked
     patch information is stored for the decoder to reconstruct.
+    
+    Uses same grid-based hashing as GridSample to ensure exact alignment with
+    PTv3's coarsest features after hierarchical pooling.
+    
+    Important: Centroids are grid cell centers (not point means) to ensure
+    proper 1:1 correspondence between patches and coarse encoder features.
     """
 
     def __init__(
@@ -1898,7 +1765,7 @@ class HierarchicalMaskGenerator(object):
         patch_size: float = 0.016,
         mask_ratio: float = 0.6,
         points_per_patch: int = 128,
-        min_points_per_patch: int = 4,
+        min_points_per_patch: int = 0,
         view_keys: tuple = ("coord", "origin_coord", "energy"),
     ):
         self.patch_size = patch_size
@@ -1906,6 +1773,20 @@ class HierarchicalMaskGenerator(object):
         self.points_per_patch = points_per_patch
         self.min_points_per_patch = min_points_per_patch
         self.view_keys = view_keys
+
+    @staticmethod
+    def fnv_hash_vec(arr):
+        """FNV64-1A hash for grid coordinates"""
+        assert arr.ndim == 2
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * np.ones(
+            arr.shape[0], dtype=np.uint64
+        )
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
 
     def __call__(self, data_dict):
         coord = data_dict["coord"]
@@ -1915,16 +1796,13 @@ class HierarchicalMaskGenerator(object):
             data_dict["hmae_valid"] = False
             return data_dict
 
-        # coarse grid coordinates
+        # grid coordinates aligned to patch_size, matching PTv3's grid structure
+        # matches: floor((coord - coord.min()) / patch_size) after 4x stride-2 poolings
         coord_min = coord.min(axis=0)
-        grid_coord = ((coord - coord_min) / self.patch_size).astype(np.int32)
+        grid_coord = np.floor((coord - coord_min) / self.patch_size).astype(np.int64)
 
-        # spatial hash: pack (x, y, z) into int64
-        patch_ids = (
-            grid_coord[:, 0].astype(np.int64) * 1000000
-            + grid_coord[:, 1].astype(np.int64) * 1000
-            + grid_coord[:, 2].astype(np.int64)
-        )
+        # spatial hash using FNV (same as GridSample for consistency)
+        patch_ids = self.fnv_hash_vec(grid_coord)
 
         # unique patches and assignment of each point to a patch
         unique_patches, inverse_indices, patch_counts = np.unique(
@@ -1966,8 +1844,8 @@ class HierarchicalMaskGenerator(object):
         # sort points once by patch index for efficient masked patch processing
         # this avoids repeatedly doing (inverse_indices == patch_idx) per patch
         order = np.argsort(inverse_indices)
-        sorted_inverse = inverse_indices[order]
         sorted_coord = coord[order]
+        sorted_grid_coord = grid_coord[order]
         has_energy = "energy" in data_dict
         if has_energy:
             sorted_energy = data_dict["energy"][order]
@@ -1993,8 +1871,12 @@ class HierarchicalMaskGenerator(object):
                 continue  # should not happen if min_points_per_patch checked
 
             patch_coord = sorted_coord[start:end]
-            # centroid
-            centroid = patch_coord.mean(axis=0)
+            patch_grid_coord = sorted_grid_coord[start:end]
+            
+            # centroid = geometric center of grid cell (not point mean)
+            # all points in this patch share the same grid coordinate
+            grid_cell = patch_grid_coord[0]  # same for all points in patch
+            centroid = grid_cell * self.patch_size + self.patch_size / 2.0 + coord_min
             masked_centroids.append(centroid)
 
             # relative coords in [-1, 1]
@@ -2029,8 +1911,35 @@ class HierarchicalMaskGenerator(object):
         data_dict["masked_centroids"] = np.asarray(masked_centroids, dtype=np.float32)
         data_dict["masked_point_counts"] = np.asarray(masked_point_counts, dtype=np.int64)
 
-        data_dict["masked_target_coords"] = masked_target_coords
-        data_dict["masked_target_energy"] = masked_target_energy
+        # pack masked patch targets into flattened arrays with offsets (no padding)
+        # This replaces the need for HMAECollate
+        target_coords_list = []
+        target_energy_list = []
+        
+        for i, coords in enumerate(masked_target_coords):
+            target_coords_list.append(coords)
+            if i < len(masked_target_energy):
+                energy = masked_target_energy[i]
+                if energy.ndim == 1:
+                    energy = energy[:, None]
+                target_energy_list.append(energy)
+            else:
+                # Create zeros if energy not available for this patch
+                target_energy_list.append(np.zeros((coords.shape[0], 1), dtype=np.float32))
+        
+        # concatenate into flattened arrays
+        target_coords_flat = np.concatenate(target_coords_list, axis=0)  # (total_points, 3)
+        target_energy_flat = np.concatenate(target_energy_list, axis=0)  # (total_points, 1)
+        
+        # compute offset per batch sample (not per patch)
+        # output just the total point count for this sample
+        # batching will convert this to cumulative offsets per batch sample
+        total_points = target_coords_flat.shape[0]
+        target_offset = np.array([total_points], dtype=np.int64)
+        
+        data_dict["target_coords"] = target_coords_flat
+        data_dict["target_energy"] = target_energy_flat
+        data_dict["target_offset"] = target_offset
 
         data_dict["n_visible_patches"] = n_visible
         data_dict["n_masked_patches"] = len(masked_centroids)
@@ -2041,56 +1950,57 @@ class HierarchicalMaskGenerator(object):
 class HMAECollate(object):
     """
     Custom collation for HMAE that handles variable-length masked patches.
-    
-    Converts lists of target coordinates/energies into packed tensors with offsets.
+
+    Packs target coordinates/energies into flattened arrays with offsets (no padding).
+    Assumes 'energy' will always be present in data_dict.
     """
-    
+
     def __init__(
         self,
         points_per_patch: int = 128,
     ):
         self.points_per_patch = points_per_patch
-    
+
     def __call__(self, data_dict):
         if not data_dict.get("hmae_valid", False):
             return data_dict
-        
-        # pack target coordinates with padding to fixed K
-        K = self.points_per_patch
+
         masked_target_coords = data_dict["masked_target_coords"]
-        masked_target_energy = data_dict.get("masked_target_energy", [])
-        
-        n_patches = len(masked_target_coords)
-        
-        # create padded arrays
-        padded_coords = np.zeros((n_patches, K, 3), dtype=np.float32)
-        padded_energy = np.zeros((n_patches, K, 1), dtype=np.float32)
-        target_mask = np.zeros((n_patches, K), dtype=bool)
-        
+        masked_target_energy = data_dict["masked_target_energy"]
+
+        # pack into flattened arrays with offsets
+        target_coords_list = []
+        target_energy_list = []
+        target_point_counts = []
+
         for i, coords in enumerate(masked_target_coords):
-            n_pts = min(coords.shape[0], K)
-            if coords.shape[0] > K:
-                # randomly sample K points
-                idx = np.random.choice(coords.shape[0], K, replace=False)
-                padded_coords[i] = coords[idx]
-                if len(masked_target_energy) > i:
-                    padded_energy[i] = masked_target_energy[i][idx]
-                target_mask[i, :] = True
-            else:
-                padded_coords[i, :n_pts] = coords
-                if len(masked_target_energy) > i:
-                    padded_energy[i, :n_pts] = masked_target_energy[i]
-                target_mask[i, :n_pts] = True
-        
-        data_dict["target_coords_padded"] = padded_coords
-        data_dict["target_energy_padded"] = padded_energy
-        data_dict["target_mask"] = target_mask
-        
+            n_pts = coords.shape[0]
+            target_coords_list.append(coords)
+            target_point_counts.append(n_pts)
+
+            energy = masked_target_energy[i]
+            if energy.ndim == 1:
+                energy = energy[:, None]
+            target_energy_list.append(energy)
+
+        # concatenate into flattened arrays
+        target_coords_flat = np.concatenate(target_coords_list, axis=0)  # (total_points, 3)
+        target_energy_flat = np.concatenate(target_energy_list, axis=0)  # (total_points, 1)
+
+        # compute offset per batch sample (not per patch)
+        # output just the total point count for this sample
+        # batching will convert this to cumulative offsets per batch sample
+        total_points = target_coords_flat.shape[0]
+        target_offset = np.array([total_points], dtype=np.int64)
+
+        data_dict["target_coords"] = target_coords_flat
+        data_dict["target_energy"] = target_energy_flat
+        data_dict["target_offset"] = target_offset
+
         # clean up lists
         del data_dict["masked_target_coords"]
-        if "masked_target_energy" in data_dict:
-            del data_dict["masked_target_energy"]
-        
+        del data_dict["masked_target_energy"]
+
         return data_dict
 
 

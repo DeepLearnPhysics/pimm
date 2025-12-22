@@ -110,6 +110,64 @@ def default_argument_parser(epilog=None):
     return parser
 
 
+def _set_nested(d, key_path, value):
+    """Set nested dict value: 'a.b.c' -> d['a']['b']['c'] = value"""
+    keys = key_path.split('.')
+    for key in keys[:-1]:
+        d = d.setdefault(key, {})
+    d[keys[-1]] = value
+
+
+def _apply_hook_overrides_from_dict(cfg, override_dict):
+    """
+    Apply hook parameter overrides from a dict.
+    
+    Args:
+        cfg: Config object
+        override_dict: Dict mapping hook type to parameter dict.
+                      Example: {"WandbNamer": {"extra": "fft"}, "InstanceSegmentationEvaluator": {"every_n_steps": 500}}
+    """
+    if not hasattr(cfg, 'hooks') or not override_dict:
+        return
+    
+    for hook_type, params in override_dict.items():
+        if not isinstance(params, dict):
+            continue
+        
+        # find and update matching hook(s)
+        for hook_cfg in cfg.hooks:
+            if hook_cfg.get('type') == hook_type:
+                for param_path, val in params.items():
+                    _set_nested(hook_cfg, param_path, val)
+
+
+def _apply_hook_overrides(cfg, options):
+    """
+    Process --options hooks.HookType.param=value and apply to matching hooks.
+    
+    Example: --options hooks.PretrainEvaluator.every_n_steps=500
+    """
+    if not hasattr(cfg, 'hooks') or not options:
+        return
+    
+    for key, val in options.items():
+        if not key.startswith('hooks.'):
+            continue
+        
+        # parse: hooks.HookType.param.subparam -> (HookType, param.subparam)
+        parts = key.split('.', 2)
+        if len(parts) < 3:
+            continue
+        
+        hook_type = parts[1]
+        param_path = parts[2]
+        
+        # find and update matching hook(s)
+        for hook_cfg in cfg.hooks:
+            if hook_cfg.get('type') == hook_type:
+                _set_nested(hook_cfg, param_path, val)
+
+
 def default_config_parser(file_path, options):
     # config name protocol: dataset_name/model_name-exp_name
     if os.path.isfile(file_path):
@@ -118,8 +176,16 @@ def default_config_parser(file_path, options):
         sep = file_path.find("-")
         cfg = Config.fromfile(os.path.join(file_path[:sep], file_path[sep + 1 :]))
 
+    # Apply hook overrides from config file (hooks_override dict)
+    if hasattr(cfg, 'hooks_override'):
+        _apply_hook_overrides_from_dict(cfg, cfg.hooks_override)
+        # Remove hooks_override from config after processing (it's not a real config key)
+        delattr(cfg, 'hooks_override')
+
     if options is not None:
         cfg.merge_from_dict(options)
+        cfg._cli_options = set(options.keys())  # track CLI-provided keys for ConfigModifier
+        _apply_hook_overrides(cfg, options)
 
     if cfg.seed is None:
         cfg.seed = get_random_seed()

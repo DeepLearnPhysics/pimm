@@ -20,7 +20,7 @@ from larfm.models.utils.structure import Point
 from larfm.models.builder import MODELS, build_model
 from larfm.models.modules import PointModel, PointModule  # noqa: F401
 from larfm.models.utils import offset2batch, offset2bincount, batch2offset
-from larfm.utils.comm import get_world_size  # noqa: F401
+from larfm.utils.comm import get_world_size, all_gather  # noqa: F401
 from larfm.utils.scheduler import CosineScheduler
 
 
@@ -294,18 +294,17 @@ class Sonata(PointModel):
     def sinkhorn_knopp(feat, temp, num_iter=3):
         feat = feat.float()
         q = torch.exp(feat / temp).t()
-        if get_world_size() > 1:
-            n_tensor = torch.tensor([q.shape[1]], device=q.device, dtype=torch.float32)
-            dist.all_reduce(n_tensor, op=dist.ReduceOp.SUM)
-            n = int(n_tensor.item())
-        else:
-            n = int(q.shape[1])  # number of samples to assign
         k = q.shape[0]  # number of prototypes
-
-        # make the matrix sums to 1
-        sum_q = q.sum()
+        
+        # batch n and sum_q into single allreduce
+        n_local = q.shape[1]
+        sum_q_local = q.sum()
         if get_world_size() > 1:
-            dist.all_reduce(sum_q)
+            scalars = torch.stack([q.new_tensor(n_local), sum_q_local])
+            dist.all_reduce(scalars)
+            n, sum_q = scalars[0], scalars[1]
+        else:
+            n, sum_q = q.new_tensor(n_local), sum_q_local
         q = q / sum_q
 
         for i in range(num_iter):
@@ -556,11 +555,16 @@ class Sonata(PointModel):
             result_dict["loss"].append(unmask_loss * self.unmask_loss_weight)
 
         result_dict["loss"] = sum(result_dict["loss"])
+        result_dict['total_loss'] = result_dict['loss'].detach().clone()
 
+        # sync component losses for logging
         if get_world_size() > 1:
-            for loss in result_dict.values():
-                loss = loss.clone()
-                dist.nn.all_reduce(loss, op=dist.ReduceOp.SUM)
-                loss.div_(get_world_size())
+            for key in list(result_dict.keys()):
+                if key == 'loss':
+                    continue
+                synced_loss = result_dict[key].detach()
+                dist.all_reduce(synced_loss, op=dist.ReduceOp.SUM)
+                synced_loss.div_(get_world_size())
+                result_dict[key] = synced_loss
         return result_dict
 

@@ -14,10 +14,10 @@ from typing import Literal
 from larfm.utils.logger import get_root_logger
 from .builder import DATASETS
 from .transform import Compose, TRANSFORMS
-
+from .hepdataset import HEPDataset
 
 @DATASETS.register_module()
-class PILArNetH5Dataset(Dataset):
+class PILArNetH5Dataset(HEPDataset):
     """
     PILArNet-M Dataset that loads directly from h5 files, avoiding the need for preprocessing to individual files.
 
