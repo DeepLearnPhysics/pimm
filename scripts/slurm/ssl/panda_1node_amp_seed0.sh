@@ -45,7 +45,7 @@ elif [ $SLURM_ARRAY_TASK_ID -eq 5 ]; then
 fi
 
 TRAIN_PATH=/sdf/home/y/youngsam/sw/dune/representations/lar.fm/scripts/train.sh
-COMMAND="sh ${TRAIN_PATH} -m 1 -g 1 -d panda/pretrain -c ${CONFIG} -n ${CONFIG}-${MAX_LEN}-${EPOCH}-${CURRENT_DATETIME} -- --options data.train.max_len=${MAX_LEN} epoch=${EPOCH} num_worker=6 wandb_run_name=${CONFIG}-${MAX_LEN}-${EPOCH}"
+COMMAND="sh ${TRAIN_PATH} -m 1 -g 1 -d panda/pretrain -c ${CONFIG} -n ${CONFIG}-${MAX_LEN}-${EPOCH}-${CURRENT_DATETIME} -- --options data.train.max_len=${MAX_LEN} epoch=${EPOCH}"
 
 srun singularity run --nv -B /sdf,/fs,/sdf/scratch,/lscratch ${SINGULARITY_IMAGE_PATH} \
     bash -c "source ~/.bashrc && mamba activate pointcept-torch2.5.0-cu12.4 && ${COMMAND} $1"

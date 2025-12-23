@@ -1,4 +1,4 @@
-name: pointcept-torch2.6.0-cu12.4
+name: larfm-torch2.5.0-cu12.4
 channels:
   # - pytorch
   - nvidia/label/cuda-12.4.1
@@ -14,8 +14,8 @@ dependencies:
   - gcc=13.2
   - gxx=13.2
   - pytorch=2.5.0
-  - torchvision=0.21.0
-  - torchaudio=2.6.0
+  - torchvision=0.20.0
+  - torchaudio=2.5.0
   - pytorch-cuda=12.4
   - ninja
   - google-sparsehash
