@@ -198,7 +198,7 @@ Example configs can be found in:
 
 ## Model Zoo
 
-### SparseUNet {#sparseunet}
+### SparseUNet
 
 This repository provides `SparseUNet` implemented by `SpConv` and `MinkowskiEngine`. The SpConv version is recommended since SpConv is easy to install and faster than MinkowskiEngine. Meanwhile, SpConv is also widely applied in outdoor perception.
 
@@ -206,7 +206,7 @@ To use:
 1. Install wither MinkowskiEngine or spconv (recommended)
 3. Change the backbone in any config to `SpUNet-v1m1` or e.g. `MinkUNet50`. See [mink_unet.py](pimm/models/sparse_unet/mink_unet.py) for more model definitions.
 
-### Point Transformers {#point-transformers}
+### Point Transformers
 
 - **PTv3**
 
@@ -218,7 +218,7 @@ If you can not upgrade your local environment to satisfy the requirements (CUDA 
 
 `PTv2 Mode2` enables AMP and disables _Position Encoding Multiplier_ & _Grouped Linear_. 
 
-### Swin3D {#swin3d}
+### Swin3D
 
 [Swin3D](https://github.com/microsoft/Swin3D) is a hierarchical 3D Swin Transformer backbone.
 
@@ -235,15 +235,15 @@ pip install ./
 2. Uncomment `# from .swin3d import *` in `pointcept/models/__init__.py`.
 3. Change the backbone in any config to `Swin3D-v1m1`
 
-### PointGroup {#pointgroup}
+### PointGroup
 
 [PointGroup](https://github.com/dvlab-research/PointGroup) is an instance segmentation method that clusters points into object instances.
 
-### Panda Detector {#detector}
+### Panda Detector
 
 [Panda Detector](https://arxiv.org/abs/2512.01324) is a Mask2former-like objection detection framework for particle trajectories in LArTPC images.
 
-### Sonata {#sonata}
+### Sonata
 
 [Sonata](https://arxiv.org/abs/2503.16429) is a discriminative self-supervised pre-training method similar to DINO for point clouds.
 
@@ -349,7 +349,6 @@ hooks = [
     ...
 ]
 ```
-
 
 ## Troubleshooting
 
