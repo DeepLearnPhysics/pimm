@@ -1,4 +1,5 @@
-# Particle Imaging Models (pimm) - foundation model research for particle imaging detectors
+# Particle Imaging Models (pimm)
+## Foundation model research for particle imaging detectors
 
 A codebase for perception research for time projection chambers (TPCs), with a focus on liquid argon TPCs, built on the [Pointcept](https://github.com/Pointcept/Pointcept) training and inference framework.
 
