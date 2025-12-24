@@ -260,10 +260,15 @@ The entry point is `scripts/train.sh`. The script accepts the following key argu
 
 - `-m`: Number of machines (nodes)
 - `-g`: Number of GPUs per machine
-- `-d`: Dataset/config directory (e.g., `panda/pretrain`, `panda/semseg`)
+- `-d`: Config directory (e.g., `panda/pretrain`, `panda/semseg`)
 - `-c`: Config name (without `.py` extension)
 - `-n`: Experiment name (used for output directory)
 - `-w`: Path to checkpoint file (for fine-tuning/resuming)
+
+Additional arguments modifying underlying config values by passing `-- --options keyword1=val1 keyword2=val2` at the end of the
+training scripts. E.g., to change the number of epochs to 10, pass `sh scripts/train.sh -g 1 ... -- --options epoch=10`.
+
+To guarantee reproducibility as the codebase changes over time, the entire repository is copied into the experiment folder prior to running each experiment.
 
 ### Pre-training Example
 
