@@ -441,19 +441,11 @@ class PretrainEvaluator(HookBase):
         if self.trainer.cfg.evaluate and self.every_n_steps > 0:
             global_iter = self.trainer.comm_info['iter'] + self.trainer.comm_info['iter_per_epoch'] * self.trainer.comm_info['epoch']
             if (global_iter + 1) % self.every_n_steps == 0:
-                if comm.get_world_size() > 1:
-                    if comm.get_rank() == 0:
-                        self.eval()
-                else:
-                    self.eval()
+                self.eval()
 
     def after_epoch(self):
         if self.trainer.cfg.evaluate and self.every_n_steps == 0:
-            if comm.get_world_size() > 1:
-                if comm.get_rank() == 0:
-                    self.eval()
-            else:
-                self.eval()
+            self.eval()
 
     def _unwrap_model(self):
         if isinstance(self.trainer.model, torch.nn.parallel.DistributedDataParallel):
@@ -503,13 +495,7 @@ class PretrainEvaluator(HookBase):
             
             # Extract features for this event
             event_features = features[start_idx:end_idx]
-            
-            # Add global context by concatenating mean features
-            batch_mean = torch.mean(event_features, dim=0, keepdim=True)
-            features_with_context = torch.cat([event_features, batch_mean.expand(event_features.shape[0], -1)], dim=1)
-            
-            batch_features.append(features_with_context.cpu())
-            
+            batch_features.append(event_features.cpu())
             # Extract labels for each label type
             for label_name in self.labels:
                 event_labels = all_labels[label_name][start_idx:end_idx]
@@ -518,8 +504,20 @@ class PretrainEvaluator(HookBase):
         return batch_features, batch_labels_dict
 
     def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        # All ranks participate in evaluation
         self.trainer.model.eval()
+        
+        world_size = comm.get_world_size()
+        rank = comm.get_rank()
+        
+        if rank == 0:
+            self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+
+        # Calculate per-rank event targets to ensure total events match max_train_events + max_test_events
+        # Each rank collects its share of events
+        per_rank_train_events = (self.max_train_events + world_size - 1) // world_size  # Ceiling division
+        per_rank_test_events = (self.max_test_events + world_size - 1) // world_size  # Ceiling division
+        per_rank_total_events = per_rank_train_events + per_rank_test_events
 
         # Collect features and labels from events (features shared, labels per label type)
         train_features = []
@@ -529,16 +527,17 @@ class PretrainEvaluator(HookBase):
         
         event_count = 0
         
+        # All ranks iterate their shard of the distributed loader
         for i, input_dict in enumerate(self.trainer.val_loader):
             batch_features, batch_labels_dict = self._process_batch_with_offsets(input_dict)
             
             # Process each event in the batch
             for event_idx, event_features in enumerate(batch_features):
-                if event_count < self.max_train_events:
+                if event_count < per_rank_train_events:
                     train_features.append(event_features)
                     for label_name in self.labels:
                         train_labels_dict[label_name].append(batch_labels_dict[label_name][event_idx])
-                elif event_count < self.max_train_events + self.max_test_events:
+                elif event_count < per_rank_total_events:
                     test_features.append(event_features)
                     for label_name in self.labels:
                         test_labels_dict[label_name].append(batch_labels_dict[label_name][event_idx])
@@ -547,19 +546,57 @@ class PretrainEvaluator(HookBase):
                     
                 event_count += 1
                 
-            # Stop if we have enough events
-            if event_count >= self.max_train_events + self.max_test_events:
+            # Stop if we have enough events for this rank
+            if event_count >= per_rank_total_events:
                 break
+
+        # Gather all events from all ranks to rank 0
+        if world_size > 1:
+            # Gather train features
+            train_features_gathered = comm.gather(train_features, dst=0)
+            # Gather test features
+            test_features_gathered = comm.gather(test_features, dst=0)
+            # Gather train labels for each label type
+            train_labels_gathered_dict = {}
+            test_labels_gathered_dict = {}
+            for label_name in self.labels:
+                train_labels_gathered_dict[label_name] = comm.gather(train_labels_dict[label_name], dst=0)
+                test_labels_gathered_dict[label_name] = comm.gather(test_labels_dict[label_name], dst=0)
+            
+            if rank == 0:
+                # Flatten gathered lists and truncate to exact target counts
+                train_features = [f for features_list in train_features_gathered for f in features_list][:self.max_train_events]
+                test_features = [f for features_list in test_features_gathered for f in features_list][:self.max_test_events]
+                
+                for label_name in self.labels:
+                    train_labels_dict[label_name] = [l for labels_list in train_labels_gathered_dict[label_name] for l in labels_list][:self.max_train_events]
+                    test_labels_dict[label_name] = [l for labels_list in test_labels_gathered_dict[label_name] for l in labels_list][:self.max_test_events]
+            else:
+                # Non-rank-0 processes set model back to train and wait
+                self.trainer.model.train()
+                comm.synchronize()
+                return
+        else:
+            # Single process case - truncate to exact counts
+            train_features = train_features[:self.max_train_events]
+            test_features = test_features[:self.max_test_events]
+            for label_name in self.labels:
+                train_labels_dict[label_name] = train_labels_dict[label_name][:self.max_train_events]
+                test_labels_dict[label_name] = test_labels_dict[label_name][:self.max_test_events]
         
+        # Only rank 0 reaches here (or single-process case)
         # Concatenate features (shared across all labels)
         if not train_features or not test_features:
             self.trainer.logger.error("Not enough events for train/test split")
+            self.trainer.model.train()
+            if world_size > 1:
+                comm.synchronize()
             return
             
         X_train = torch.cat(train_features, dim=0)
         X_test = torch.cat(test_features, dim=0)
 
-        self.trainer.logger.info(f"Train events: {len(train_features)}, Test features events: {len(test_features)}")
+        self.trainer.logger.info(f"Train events: {len(train_features)}, Test events: {len(test_features)}")
         self.trainer.logger.info(f"Train features: {X_train.shape}, Test features: {X_test.shape}")
         
         # Now evaluate for each label type
@@ -586,175 +623,57 @@ class PretrainEvaluator(HookBase):
             
             # Run evaluation for this label
             self._evaluate_single_label(X_train, y_train, X_test, y_test, eval_prefix, label_class_weights, label_class_names)
+        
+        # Set model back to train mode
+        self.trainer.model.train()
+        
+        # Synchronize before returning (ensure all ranks finish together)
+        if world_size > 1:
+            comm.synchronize()
     
     def _evaluate_single_label(self, X_train, y_train, X_test, y_test, eval_prefix, label_class_weights, label_class_names):
-        """Train and evaluate a linear classifier for a single label type."""
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        input_dim = X_train.shape[1]
-        
+        """Train and evaluate a grid of linear classifiers for a single label type."""
+        from pimm.engines.hooks.eval.linear import LinearProbingTrainer, LinearProbingConfig
+
         # Use provided class names or fall back to default
         if label_class_names is None:
             label_class_names = self.trainer.cfg.data.names
 
-        import torch.nn as nn
-        import torch.optim as optim
-        from torch.utils.data import TensorDataset, DataLoader
-        import torch.nn.functional as F
-        from torch.nn.modules.loss import _WeightedLoss
-        from typing import Optional
-        from torch import Tensor
-
-        class SoftmaxFocalLoss(_WeightedLoss):
-            def __init__(
-                self,
-                weight: Optional[Tensor] = None,
-                size_average: Optional[bool] = None,
-                reduce: Optional[bool] = None,
-                reduction: str = "mean",
-                gamma: float = 2,
-                ignore_index: int = -1,
-            ):
-                super().__init__(weight, size_average, reduce, reduction)
-                self.gamma = gamma
-                self.ignore_index = ignore_index
-
-            def forward(self, logits, labels):
-                flattened_logits = logits.reshape(-1, logits.shape[-1])
-                flattened_labels = labels.view(-1)
-
-                p_t = flattened_logits.softmax(dim=-1)
-                ce_loss = F.cross_entropy(
-                    flattened_logits,
-                    flattened_labels,
-                    reduction="none",
-                    ignore_index=self.ignore_index,
-                )  # -log(p_t)
-
-                alpha_t = (
-                    self.weight
-                    if self.weight is not None
-                    else torch.ones(flattened_logits.shape[-1]).to(device)
-                )
-                loss = (
-                    alpha_t[flattened_labels]
-                    * ((1 - p_t[torch.arange(p_t.shape[0]), flattened_labels]) ** self.gamma)
-                    * ce_loss
-                )
-
-                if self.reduction == "mean":
-                    loss = loss.sum() / labels.ne(self.ignore_index).sum()
-                elif self.reduction == "sum":
-                    loss = loss.sum()
-                elif self.reduction == "none":
-                    pass
-                else:
-                    raise ValueError(f"Invalid reduction: {self.reduction}")
-                return loss
-
         num_classes = int(y_train.max().item()) + 1
-        clf = nn.Linear(input_dim, num_classes).to(device)
 
-        X_train = X_train.to(device)
-        y_train = y_train.to(device)
-        X_test = X_test.to(device)
-        y_test = y_test.to(device)
+        cfg = LinearProbingConfig()
+        trainer = LinearProbingTrainer(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            num_classes=num_classes,
+            logger=self.trainer.logger,
+            config=cfg,
+        )
+        metrics = trainer.train_and_evaluate()
 
-        # compute class weights from y_train
-        with torch.no_grad():
-            labels_flat = y_train.view(-1)
-            num_classes_ = int(labels_flat.max().item()) + 1
-            class_counts = torch.bincount(labels_flat, minlength=num_classes_).float()
-            class_weights = 1.0 / (class_counts + 1e-6)
-            class_weights = class_weights / class_weights.sum() * num_classes_
+        m_iou = metrics["m_iou"]
+        m_precision = metrics["m_precision"]
+        m_recall = metrics["m_recall"]
+        m_f1 = metrics["m_f1"]
+        iou_class = metrics["iou_class"]
+        precision_class = metrics["precision_class"]
+        recall_class = metrics["recall_class"]
+        f1_class = metrics["f1_class"]
+        cm = metrics["confusion_matrix"]
+        class_support = metrics["class_support"]
 
-        criterion = SoftmaxFocalLoss(weight=class_weights.to(device))
-        optimizer = optim.AdamW(clf.parameters(), lr=0.001, weight_decay=0.01)
+        self.trainer.storage.put_scalar(f"{eval_prefix}_val_intersection", iou_class * (class_support + 1e-10))
+        self.trainer.storage.put_scalar(f"{eval_prefix}_val_union", (class_support + 1e-10))
+        self.trainer.storage.put_scalar(f"{eval_prefix}_val_target", class_support)
 
-        # add inverse sqrt lr scheduler
-        def inv_sqrt_lr_lambda(step):
-            return 1.0 / (step ** 0.5) if step > 0 else 1.0
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=inv_sqrt_lr_lambda)
-
-        batch_size = 256
-        train_dataset = TensorDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-        num_epochs = 10
-        # early stopping placeholders (not used)
-        patience = 5  # noqa: F841
-        best_test_loss = float("inf")  # noqa: F841
-        epochs_no_improve = 0  # noqa: F841
-        best_state_dict = None  # noqa: F841
-        stop_training = False
-
-        global_step = 0
-        for epoch in range(num_epochs):
-            if stop_training:
-                break
-            clf.train()
-            running_loss = 0.0
-            num_samples = 0
-
-            for batch_idx, (inputs, targets) in enumerate(train_loader):
-                optimizer.zero_grad()
-                outputs = clf(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                global_step += 1
-                running_loss += loss.item() * inputs.size(0)
-                num_samples += inputs.size(0)
-                clf.train()
-            
-            epoch_loss = running_loss / len(train_dataset)
-            clf.eval()
-            with torch.no_grad():
-                test_outputs = clf(X_test)
-                final_test_loss = criterion(test_outputs, y_test).item()
-            self.trainer.logger.info(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Test Loss: {final_test_loss:.4f}")
-            clf.train()
-
-        clf.eval()
-        with torch.no_grad():
-            test_outputs = clf(X_test)
-            _, test_preds = torch.max(test_outputs, 1)
-            test_preds = test_preds.cpu()
-
-        y_test = y_test.cpu()
-
-        from sklearn.metrics import precision_score, recall_score, f1_score
-        precision = precision_score(y_test, test_preds, average=None, zero_division=0, labels=range(num_classes))
-        recall = recall_score(y_test, test_preds, average=None, zero_division=0, labels=range(num_classes))
-        f1 = f1_score(y_test, test_preds, average=None, zero_division=0, labels=range(num_classes))
-
-        m_precision = np.mean(precision)
-        m_recall = np.mean(recall)
-        m_f1 = np.mean(f1)
-
-        intersection = np.zeros(num_classes)
-        union = np.zeros(num_classes)
-        cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-        for c in range(num_classes):
-            pred_c = (test_preds == c)
-            true_c = (y_test == c)
-            intersection[c] = np.logical_and(pred_c, true_c).sum()
-            union[c] = np.logical_or(pred_c, true_c).sum()
-        for true_label, pred_label in zip(y_test, test_preds):
-            cm[int(true_label), int(pred_label)] += 1
-        iou_class = intersection / (union + 1e-10)
-        m_iou = np.mean(iou_class)
-        self.trainer.storage.put_scalar(f"{eval_prefix}_val_intersection", intersection)
-        self.trainer.storage.put_scalar(f"{eval_prefix}_val_union", union)
-        self.trainer.storage.put_scalar(f"{eval_prefix}_val_target", np.sum(cm, axis=1))
-        
         self.trainer.logger.info(
             "Val result: mIoU/mPrec/mRec/mF1 {:.4f}/{:.4f}/{:.4f}/{:.4f}.".format(
                 m_iou, m_precision, m_recall, m_f1
             )
         )
-        
+
         from rich.table import Table
         from rich.console import Console
 
@@ -767,15 +686,14 @@ class PretrainEvaluator(HookBase):
         table.add_column("F1", justify="right")
         table.add_column("Support", justify="right")
 
-        class_support = np.sum(cm, axis=1)
         for i in range(num_classes):
             table.add_row(
                 str(i),
                 str(label_class_names[i]),
                 f"{iou_class[i]:.4f}",
-                f"{precision[i]:.4f}",
-                f"{recall[i]:.4f}",
-                f"{f1[i]:.4f}",
+                f"{precision_class[i]:.4f}",
+                f"{recall_class[i]:.4f}",
+                f"{f1_class[i]:.4f}",
                 str(class_support[i]),
             )
 
@@ -808,17 +726,17 @@ class PretrainEvaluator(HookBase):
                     )
                     self.trainer.writer.add_scalar(
                         f"{eval_prefix}val/cls_{i}-{label_class_names[i]} F1",
-                        f1[i],
+                        f1_class[i],
                         self.trainer.writer.run.step
                     )
                     self.trainer.writer.add_scalar(
                         f"{eval_prefix}val/cls_{i}-{label_class_names[i]} Precision",
-                        precision[i],
+                        precision_class[i],
                         self.trainer.writer.run.step
                     )
                     self.trainer.writer.add_scalar(
                         f"{eval_prefix}val/cls_{i}-{label_class_names[i]} Recall",
-                        recall[i],
+                        recall_class[i],
                         self.trainer.writer.run.step
                     )
 
@@ -827,241 +745,6 @@ class PretrainEvaluator(HookBase):
             self.trainer.comm_info["current_metric_name"] = "mF1"
         self.trainer.comm_info["current_metric_value"] = m_f1
         self.trainer.comm_info[f"{_prefix}_current_metric_value"] = m_f1
-        self.trainer.model.train()
-
-@HOOKS.register_module()
-class EnergyClassifierEvaluator(HookBase):
-    def __init__(
-        self,
-        every_n_steps=1,
-        max_train_events=250,
-        max_test_events=250,
-        class_weights=None,
-        prefix="",
-    ):
-        self.every_n_steps = every_n_steps
-        self.max_train_events = max_train_events
-        self.max_test_events = max_test_events
-        self.class_weights = class_weights
-        self.prefix = prefix
-
-    def after_step(self):
-        if self.trainer.cfg.evaluate and self.every_n_steps > 0:
-            global_iter = (
-                self.trainer.comm_info["iter"]
-                + self.trainer.comm_info["iter_per_epoch"]
-                * self.trainer.comm_info["epoch"]
-            )
-            if (global_iter + 1) % self.every_n_steps == 0:
-                if comm.get_world_size() > 1:
-                    if comm.get_rank() == 0:
-                        self.eval()
-                else:
-                    self.eval()
-
-    def after_epoch(self):
-        if self.trainer.cfg.evaluate and self.every_n_steps == 0:
-            if comm.get_world_size() > 1:
-                if comm.get_rank() == 0:
-                    self.eval()
-            else:
-                self.eval()
-
-    def _unwrap_model(self):
-        if isinstance(self.trainer.model, torch.nn.parallel.DistributedDataParallel):
-            return self.trainer.model.module
-        return self.trainer.model
-
-    def get_backbone(self):
-        model = self._unwrap_model()
-        if hasattr(model, "teacher"): # sonata
-            return model.teacher["backbone"]
-        return model['backbone']
-
-    def _process_batch_with_offsets(self, input_dict):
-        """Process a batch and extract features properly using offsets to handle multiple events"""
-        for key in input_dict.keys():
-            if isinstance(input_dict[key], torch.Tensor):
-                input_dict[key] = input_dict[key].cuda(non_blocking=True)
-
-        with torch.inference_mode():
-            point = self.get_backbone()(input_dict)
-            for _ in range(2):
-                assert "pooling_inverse" in point.keys()
-                parent = point.pop("pooling_parent")
-                inverse = point.pop("pooling_inverse")
-                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
-                point = parent
-
-            while "pooling_parent" in point.keys():
-                assert "pooling_inverse" in point.keys()
-                parent = point.pop("pooling_parent")
-                inverse = point.pop("pooling_inverse")
-                parent.feat = point.feat[inverse]
-                point = parent
-
-        # Get features, labels, and offset information
-        features = point.feat[point.inverse]  # [N, C]
-        labels = point.energy[point.inverse]  # [N]
-        offsets = [0] + input_dict["offset"].cpu().tolist()  # Batch offsets
-        # Process features by batch using offsets
-        batch_features = []
-        batch_labels = []
-
-        # Use offsets to separate points from different events in the batch
-        for i in range(len(offsets) - 1):
-            start_idx = offsets[i]
-            end_idx = offsets[i + 1]
-
-            # Extract features and labels for this event
-            event_features = features[start_idx:end_idx]
-            event_labels = labels[start_idx:end_idx]
-
-            # Add global context by concatenating mean features (like in notebook)
-            batch_mean = torch.mean(event_features, dim=0, keepdim=True)
-            features_with_context = torch.cat(
-                [event_features, batch_mean.expand(event_features.shape[0], -1)], dim=1
-            )
-
-            batch_features.append(features_with_context.cpu())
-            batch_labels.append(event_labels.cpu())
-
-        return batch_features, batch_labels
-
-    def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Energy Classifier Evaluation >>>>>>>>>>>>>>>>")
-        self.trainer.model.eval()
-
-        # Collect features and labels from events
-        train_features = []
-        train_labels = []
-        test_features = []
-        test_labels = []
-
-        event_count = 0
-
-        for i, input_dict in enumerate(self.trainer.val_loader):
-            batch_features, batch_labels = self._process_batch_with_offsets(input_dict)
-
-            # Process each event in the batch
-            for event_features, event_labels in zip(batch_features, batch_labels):
-                if event_count < self.max_train_events:
-                    train_features.append(event_features)
-                    train_labels.append(event_labels)
-                elif event_count < self.max_train_events + self.max_test_events:
-                    test_features.append(event_features)
-                    test_labels.append(event_labels)
-                else:
-                    break
-
-                event_count += 1
-
-            # Stop if we have enough events
-            if event_count >= self.max_train_events + self.max_test_events:
-                break
-
-        # Concatenate all features and labels
-        if not train_features or not test_features:
-            self.trainer.logger.error("Not enough events for train/test split")
-            return
-
-        X_train = torch.cat(train_features, dim=0)
-        y_train = torch.cat(train_labels, dim=0)
-        X_test = torch.cat(test_features, dim=0)
-        y_test = torch.cat(test_labels, dim=0)
-
-        self.trainer.logger.info(
-            f"Train events: {len(train_features)}, Test events: {len(test_features)}"
-        )
-        self.trainer.logger.info(
-            f"Train features: {X_train.shape}, Test features: {X_test.shape}"
-        )
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        input_dim = X_train.shape[1]
-
-        import torch.nn as nn
-        import torch.optim as optim
-        from torch.utils.data import TensorDataset, DataLoader
-        import torch.nn.functional as F
-        from torch.nn.modules.loss import _WeightedLoss
-        from typing import Optional
-        from torch import Tensor
-
-        clf = nn.Linear(input_dim, 1).to(device)
-
-        X_train = X_train.to(device)
-        y_train = y_train.to(device)
-        X_test = X_test.to(device)
-        y_test = y_test.to(device)
-
-        criterion = nn.MSELoss()
-        optimizer = optim.AdamW(clf.parameters(), lr=0.001, weight_decay=0.01)
-
-        # add inverse sqrt lr scheduler
-        def inv_sqrt_lr_lambda(step):
-            return 1.0 / (step**0.5) if step > 0 else 1.0
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=inv_sqrt_lr_lambda
-        )
-
-        batch_size = 256
-        train_dataset = TensorDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-        num_epochs = 10
-        # early stopping placeholders (not used)
-        patience = 5  # noqa: F841
-        best_test_loss = float("inf")  # noqa: F841
-        epochs_no_improve = 0  # noqa: F841
-        best_state_dict = None  # noqa: F841
-        stop_training = False
-
-        global_step = 0
-        for epoch in range(num_epochs):
-            if stop_training:
-                break
-            clf.train()
-            running_loss = 0.0
-            num_samples = 0
-
-            for batch_idx, (inputs, targets) in enumerate(train_loader):
-                optimizer.zero_grad()
-                outputs = clf(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                global_step += 1
-                running_loss += loss.item() * inputs.size(0)
-                num_samples += inputs.size(0)
-                clf.train()
-
-            epoch_loss = running_loss / len(train_dataset)
-            clf.eval()
-            with torch.no_grad():
-                test_outputs = clf(X_test)
-                final_test_loss = criterion(test_outputs, y_test).item()
-            self.trainer.logger.info(
-                f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Test Loss: {final_test_loss:.4f}"
-            )
-            clf.train()
-
-        clf.eval()
-        with torch.no_grad():
-            test_outputs = clf(X_test)
-            final_test_loss = criterion(test_outputs, y_test).item()
-        self.trainer.logger.info(
-            f"Test Loss: {final_test_loss:.4f}"
-        )
-        self.trainer.writer.add_scalar(
-            f"{self.prefix}val/energy_mse",
-            final_test_loss,
-            self.trainer.writer.run.step,
-        )
-        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-        self.trainer.model.train()
 
 
 @HOOKS.register_module()
