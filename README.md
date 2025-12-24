@@ -325,12 +325,6 @@ The test script runs the model in evaluation mode with:
 
 Test configurations are typically defined in the config file's `data.test` section, which may include different transforms optimized for inference (e.g., test-time augmentation, different voxelization strategies).
 
-### Output
-
-Test results are saved to:
-- `exp/{dataset}/{exp_name}/test.log` - Evaluation metrics and detailed per-class statistics
-- Console output - Summary statistics (mIoU, accuracy, etc.)
-
 ## Logging
 
 Logging is available through either _Tensorboard_ or _Weights and Biases_ (recommended).
