@@ -687,7 +687,12 @@ class DictAction(Action):
         return values
 
     def __call__(self, parser, namespace, values, option_string=None):
-        options = {}
+        # Get existing options if they exist, otherwise start with empty dict
+        options = getattr(namespace, self.dest, {})
+        if not isinstance(options, dict):
+            options = {}
+        
+        # Parse new options and merge them into existing options
         for kv in values:
             key, val = kv.split("=", maxsplit=1)
             options[key] = self._parse_iterable(val)
